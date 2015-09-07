@@ -1,0 +1,10 @@
+[Unit]
+Description=rtccron suspend handler
+Before=sleep.target
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/local/sbin/rtccron suspend
+
+[Install]
+WantedBy=sleep.target

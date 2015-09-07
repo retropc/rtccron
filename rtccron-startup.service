@@ -1,0 +1,12 @@
+[Unit]
+Description=rtccron startup/shutdown handler
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/local/sbin/rtccron startup
+ExecStop=-/usr/local/sbin/rtccron shutdown
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target

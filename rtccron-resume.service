@@ -1,0 +1,10 @@
+[Unit]
+Description=rtccron resume handler
+After=suspend.target
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/local/sbin/rtccron resume
+
+[Install]
+WantedBy=suspend.target

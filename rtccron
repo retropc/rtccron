@@ -1,0 +1,290 @@
+#!/usr/bin/python
+
+RESUME_PROCESS = None
+SUSPEND_PROCESS = None
+AUTO_RESUME_PROCESS = "/usr/local/sbin/rtccron_autowakeup"
+RESUSPEND_AFTER_AUTO_RESUME = True
+VERBOSE = False
+
+import sys
+import time
+import subprocess
+import syslog
+import os
+import json
+import arrow
+
+STATE_FILE = "/var/spool/rtccron"
+SCREENSAVER = "/usr/bin/xscreensaver"
+SYSTEMCTL = "/bin/systemctl"
+RTCWAKE = "/usr/sbin/rtcwake"
+HWCLOCK = "/sbin/hwclock"
+
+syslog.openlog("rtccron")
+
+def choose_wakeup_time(now, resuspending):
+  now = arrow.get(now).to("local")
+
+  if resuspending:
+    # 02:27 tomorrow
+    return now.replace(hour=2, minute=27).replace(days=1).replace(second=0).timestamp
+  else:
+    hour, minute = now.hour, now.minute
+
+    # 00:00-02:15  wakeup at 02:27 today
+    # 02:15-03:15  wakeup at 03:27 today
+    # 03:15-23:59  wakeup at 02:27 tomorrow
+
+    if hour < 2 or (hour == 2 and minute < 15):
+      return now.replace(hour=2, minute=27, second=0).timestamp
+
+    if hour == 2 or (hour <= 3 and minute < 15):
+      return now.replace(hour=3, minute=27, second=0).timestamp
+
+    return now.replace(hour=2, minute=27).replace(days=1).replace(second=0).timestamp
+
+def execute_auto_resume():
+  info("executing auto resume tasks...")
+
+  if AUTO_RESUME_PROCESS:
+    execute(AUTO_RESUME_PROCESS)
+
+  if RESUSPEND_AFTER_AUTO_RESUME:
+    resuspend()
+
+def execute_resume():
+  info("executing resume tasks...")
+
+  if RESUME_PROCESS:
+    execute(RESUME_PROCESS)
+
+def execute_suspend():
+  info("executing suspend tasks...")
+
+  if SUSPEND_PROCESS:
+    execute(SUSPEND_PROCESS)
+
+def execute_resuspend():
+  info("executing resuspend tasks...")
+
+  systemctl("suspend")
+
+
+def resuspend():
+  debug("resuspend called")
+
+  if not state.is_still_undisturbed():
+    info("session has been disturbed, not resuspending...")
+    return
+
+  debug("session matches, resuspending...")
+  state.resuspending()
+  execute_resuspend()
+
+def suspend():
+  debug("suspend called")
+
+  if state.is_resuspending():
+    resuspending = True
+
+    debug("resuspend detected -- not executing suspend tasks")
+  else:
+    resuspending = False
+
+    execute_suspend()
+
+  now = int(time.time())
+  wakeup_time = choose_wakeup_time(now, resuspending)
+  if wakeup_time is not None:
+    state.suspending(wakeup_time)
+
+  sync()
+
+def resume():
+  debug("resume called")
+
+  if state.is_auto_resume():
+    info("auto resume detected")
+
+    # hopefully wait for xscreensaver...
+    time.sleep(5)
+
+    state.awoken()
+
+    execute_auto_resume()
+  else:
+    execute_resume()
+
+def startup():
+  debug("startup called")
+
+  state.clear()
+
+def shutdown():
+  debug("shutdown called")
+
+  state.clear()
+
+class RTC(object):
+  def is_set(self):
+    return self.__rtcwake("-m", "show") != "alarm: off\n"
+
+  def set(self, t):
+    self.__hwclock("-w")
+    self.__rtcwake("-m", "no", "-t", str(t))
+    debug("rtcwake set for %d seconds in the future (%s)" % (t - int(time.time()), time.asctime(time.localtime(t))))
+
+  def clear(self):
+    debug("rtcwake cleared")
+    self.__rtcwake("-m", "disable")
+
+  @staticmethod
+  def __rtcwake(*args):
+    return execute(RTCWAKE, *args)
+
+  @staticmethod
+  def __hwclock(*args):
+    return execute(HWCLOCK, *args)
+
+class State(object):
+  def __init__(self, fn):
+    self.fn = fn
+    self.rtc = RTC()
+
+    t = time.time()
+    with open("/proc/uptime", "r") as f:
+      self.boot_time = int(t - float(f.read().split(" ")[0]))
+
+  def suspending(self, wakeup_time):
+    self.__write("SUSPENDING", wakeup_time)
+    self.rtc.set(wakeup_time)
+
+  def awoken(self):
+    self.__write("AWOKEN", self.session_signature())
+
+  def resuspending(self):
+    self.__write("RESUSPENDING", int(time.time()))
+
+  def is_auto_resume(self):
+    wakeup_time = self.__read("SUSPENDING")
+    if wakeup_time is None:
+      return False
+
+    rtc_set = self.rtc.is_set()
+    if rtc_set:
+      self.rtc.clear()
+      return False
+
+    now = int(time.time())
+    return State.within(wakeup_time, now, 10)
+
+  def is_still_undisturbed(self):
+    session_signature = self.__read("AWOKEN")
+    if session_signature is None:
+      return False
+
+    current_session_signature = self.session_signature()
+    return current_session_signature == session_signature
+
+  def is_resuspending(self):
+    resuspend_time = self.__read("RESUSPENDING")
+    if resuspend_time is None:
+      return False
+
+    now = int(time.time())
+    return State.within(resuspend_time, now, 10)
+
+  def __write(self, state, value):
+    with open(self.fn, "wb") as f:
+      json.dump([state, self.boot_time, value], f)
+
+  def __read(self, expected_state):
+    try:
+      with open(self.fn, "rb") as f:
+        j = json.load(f)
+        if len(j) != 3:
+          return None
+
+        state, boot_time, value = j
+        debug("state/expected: %r/%r  boot_time/expected: %r/%r  value: %r" % (state, expected_state, boot_time, self.boot_time, value))
+
+        if state != expected_state:
+          return None
+
+        if not State.within(boot_time, self.boot_time, 5):
+          return None
+
+        return value
+    except (IOError, ValueError):
+      return None
+    finally:
+      self.clear(rtc=False)
+
+  def clear(self, rtc=True):
+    if rtc:
+      self.rtc.clear()
+    try:
+      os.unlink(self.fn)
+    except OSError:
+      pass
+
+  @staticmethod
+  def walk_pids():
+    for x in os.listdir("/proc"):
+      try:
+        pid = int(x)
+      except ValueError:
+        continue
+      try:
+        s = os.stat("/proc/%d" % pid)
+        dst = os.readlink("/proc/%d/exe" % pid)
+        yield pid, dst, s
+      except OSError:
+        pass
+
+  # HACK... but it works
+  @staticmethod
+  def session_signature():
+    pids = []
+    for pid, dst, s in State.walk_pids():
+      if dst == SCREENSAVER:
+        pids.append((pid, int(s.st_ctime)))
+    return ",".join("%d=%d" % x for x in sorted(pids))
+
+  @staticmethod
+  def within(a, b, epsilon):
+    return abs(a - b) < epsilon
+
+state = State(STATE_FILE)
+
+if hasattr(os, "sync"):
+  sync = os.sync
+else:
+  import ctypes
+  libc = ctypes.CDLL("libc.so.6")
+  def sync():
+    libc.sync()
+
+def systemctl(*args): return execute(SYSTEMCTL, *args)
+def execute(process, *args): return subprocess.check_output([process] + list(args))
+
+def debug(message):
+  if not VERBOSE:
+    return
+
+  print >>sys.stderr, "DEBUG", message
+  syslog.syslog(syslog.LOG_INFO, message)
+
+def info(message):
+  print >>sys.stderr, "INFO ", message
+  syslog.syslog(syslog.LOG_INFO, message)
+
+if __name__ == "__main__":
+  verbs = {
+    "startup": startup,
+    "suspend": suspend,
+    "resume": resume,
+    "shutdown": shutdown,
+    "resuspend": resuspend,
+  }
+  verbs[sys.argv[1]]()
