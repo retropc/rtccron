@@ -11,6 +11,7 @@ requirements
 - rtc wake on timer enabled in bios/uefi config
 - anacron already setup
 - rtcwake utility (from util-linux on debian)
+- [arrow](http://crsmithdev.com/arrow/) (from python-arrow on debian)
 
 setup
 -----
